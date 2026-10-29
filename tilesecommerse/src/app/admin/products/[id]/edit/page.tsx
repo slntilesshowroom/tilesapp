@@ -288,10 +288,15 @@ export default function EditProductPage({ params }: EditProductPageProps) {
     }
   };
 
-  // Variant management functions
+  // Variant management functions.
+  // Every one of these takes the updater form. Reading `variants` out of the
+  // closure instead meant a handler that fired before the previous render
+  // committed wrote a stale array back — silently dropping a sibling variant or
+  // an edit. The window grows with variant count (this whole form re-renders
+  // per keystroke), which is why it showed up once products had ~10 variants.
   const addVariant = () => {
-    setVariants([...variants, {
-      id: Math.random().toString(36).substr(2, 9),
+    setVariants(prev => [...prev, {
+      id: generateUUID(),
       color: '',
       size: '',
       productId: '',
@@ -307,13 +312,13 @@ export default function EditProductPage({ params }: EditProductPageProps) {
   };
 
   const updateVariant = (id: string, field: string, value: string) => {
-    setVariants(variants.map(v =>
+    setVariants(prev => prev.map(v =>
       v.id === id ? { ...v, [field]: value } : v
     ));
   };
 
   const removeVariant = (id: string) => {
-    setVariants(variants.filter(v => v.id !== id));
+    setVariants(prev => prev.filter(v => v.id !== id));
   };
 
   const handleVariantImageSelect = (variantId: string, files: FileList | null) => {
@@ -322,11 +327,11 @@ export default function EditProductPage({ params }: EditProductPageProps) {
     const newImages = Array.from(files).map(file => ({
       file,
       preview: URL.createObjectURL(file),
-      id: Math.random().toString(36).substr(2, 9),
+      id: generateUUID(),
       isExisting: false
     }));
 
-    setVariants(variants.map(v =>
+    setVariants(prev => prev.map(v =>
       v.id === variantId
         ? { ...v, images: [...v.images, ...newImages] }
         : v
@@ -334,8 +339,13 @@ export default function EditProductPage({ params }: EditProductPageProps) {
   };
 
   const removeVariantImage = (variantId: string, imageId: string) => {
-    setVariants(variants.map(v => {
+    setVariants(prev => prev.map(v => {
       if (v.id === variantId) {
+        const imageToRemove = v.images.find(img => img.id === imageId);
+        if (imageToRemove?.preview.startsWith('blob:')) {
+          URL.revokeObjectURL(imageToRemove.preview);
+        }
+
         const newImages = v.images.filter(img => img.id !== imageId);
         return {
           ...v,
@@ -350,7 +360,7 @@ export default function EditProductPage({ params }: EditProductPageProps) {
   };
 
   const setVariantFeaturedImage = (variantId: string, index: number) => {
-    setVariants(variants.map(v =>
+    setVariants(prev => prev.map(v =>
       v.id === variantId ? { ...v, featuredImageIndex: index } : v
     ));
   };
@@ -361,7 +371,7 @@ export default function EditProductPage({ params }: EditProductPageProps) {
     const newImages = Array.from(files).map(file => ({
       file,
       preview: URL.createObjectURL(file),
-      id: Math.random().toString(36).substr(2, 9),
+      id: generateUUID(),
       isExisting: false
     }));
 
@@ -385,13 +395,23 @@ export default function EditProductPage({ params }: EditProductPageProps) {
   };
 
   const removeImage = (id: string) => {
-    setImagePreviews(prev => {
-      const newPreviews = prev.filter(img => img.id !== id);
-      if (featuredImageIndex >= newPreviews.length) {
-        setFeaturedImageIndex(Math.max(0, newPreviews.length - 1));
-      }
-      return newPreviews;
-    });
+    const removedIndex = imagePreviews.findIndex(img => img.id === id);
+    if (removedIndex === -1) return;
+
+    const removed = imagePreviews[removedIndex];
+    if (removed.preview.startsWith('blob:')) {
+      URL.revokeObjectURL(removed.preview);
+    }
+
+    setImagePreviews(prev => prev.filter(img => img.id !== id));
+
+    // featuredImageIndex is an index into this list, so it has to follow the
+    // shift when an earlier image goes away.
+    if (removedIndex === featuredImageIndex) {
+      setFeaturedImageIndex(0);
+    } else if (removedIndex < featuredImageIndex) {
+      setFeaturedImageIndex(prev => prev - 1);
+    }
   };
 
   const setFeaturedImage = (index: number) => {
@@ -555,23 +575,20 @@ export default function EditProductPage({ params }: EditProductPageProps) {
             featuredImageIndex: variant.featuredImageIndex
           };
 
-          // Process variant images - upload new ones, keep existing ones
-          if (variant.images && variant.images.length > 0) {
-            const variantImages = [];
-            for (let i = 0; i < variant.images.length; i++) {
-              const img = variant.images[i];
-              if (img.isExisting) {
-                // Keep existing image URL
-                variantImages.push(img.preview);
-              } else if ((img as any).file) {
-                // Upload new image
-                setUploadProgress(`Processing variant ${variants.indexOf(variant) + 1} image ${i + 1}...`);
-                const base64 = await fileToBase64((img as any).file);
-                variantImages.push(base64);
-              }
+          // Always send the images key, even when empty: that is how the server
+          // learns an image was removed, and an omitted key leaves its
+          // Cloudinary asset orphaned.
+          const variantImages: string[] = [];
+          for (let i = 0; i < (variant.images?.length || 0); i++) {
+            const img = variant.images[i];
+            if (img.isExisting) {
+              variantImages.push(img.preview);
+            } else if ((img as any).file) {
+              setUploadProgress(`Processing variant ${variants.indexOf(variant) + 1} image ${i + 1}...`);
+              variantImages.push(await fileToBase64((img as any).file));
             }
-            variantData.images = variantImages;
           }
+          variantData.images = variantImages;
 
           variantsToSend.push(variantData);
         }
@@ -579,22 +596,24 @@ export default function EditProductPage({ params }: EditProductPageProps) {
         requestBody.variants = JSON.stringify(variantsToSend);
       }
 
-      // Handle new images if uploaded
-      const newImageFiles = imagePreviews.filter(img => !img.isExisting && img.file);
-      if (newImageFiles.length > 0) {
-        setUploadProgress('Processing images...');
-        const images = [];
-        for (let i = 0; i < newImageFiles.length; i++) {
-          if (newImageFiles[i].file) {
-            setUploadProgress(`Processing image ${i + 1} of ${newImageFiles.length}...`);
-            const base64 = await fileToBase64(newImageFiles[i].file!);
-            images.push(base64);
-          }
+      // Send the complete intended image list, in display order: kept images as
+      // their existing URL, new ones as base64. Sending only the new files meant
+      // the server never learned about removals, so deleting an image did
+      // nothing — it appended whatever was new onto everything it already had.
+      setUploadProgress('Processing images...');
+      const images: string[] = [];
+      for (let i = 0; i < imagePreviews.length; i++) {
+        const img = imagePreviews[i];
+        if (img.isExisting) {
+          images.push(img.preview);
+        } else if (img.file) {
+          setUploadProgress(`Processing image ${i + 1} of ${imagePreviews.length}...`);
+          images.push(await fileToBase64(img.file));
         }
-        requestBody.images = images;
       }
+      requestBody.images = images;
 
-      // FIX: Send featured image index to update which image is featured
+      // Indexes into the list above, so the server can flag the right one.
       requestBody.featuredImageIndex = featuredImageIndex;
 
       // Handle new logo if uploaded

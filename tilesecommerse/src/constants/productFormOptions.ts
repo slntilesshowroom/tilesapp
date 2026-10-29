@@ -63,6 +63,6 @@ export const ROOM_TYPE_OPTIONS: TagOption[] = [
 ];
 
 // Image upload constraints shared by every product image uploader.
+// Per-file size only — there is deliberately no cap on image count.
 export const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
-export const MAX_IMAGES = 10;
 export const VALID_IMAGE_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];

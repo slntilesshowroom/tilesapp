@@ -10,7 +10,7 @@ import {
 import { colorMapping } from "@/constants/colors";
 import {
   FINISH_TYPES, MATERIAL_TYPES, Unit, TAG_OPTIONS, ROOM_TYPE_OPTIONS,
-  MAX_FILE_SIZE, MAX_IMAGES, VALID_IMAGE_TYPES,
+  MAX_FILE_SIZE, VALID_IMAGE_TYPES,
 } from "@/constants/productFormOptions";
 import { generateUUID } from "@/utils/imageUtils";
 import {
@@ -90,10 +90,6 @@ export function PdfProductEditor({ draft, categories, onUpdate, onBack }: PdfPro
   // ── Main product images ──
   const handleImageSelect = (files: FileList | null) => {
     if (!files) return;
-    if (draft.images.length + files.length > MAX_IMAGES) {
-      setImageError(`Maximum ${MAX_IMAGES} images allowed. You can add ${Math.max(0, MAX_IMAGES - draft.images.length)} more.`);
-      return;
-    }
     const newImages: DraftImage[] = [];
     for (const file of Array.from(files)) {
       if (!VALID_IMAGE_TYPES.includes(file.type)) {

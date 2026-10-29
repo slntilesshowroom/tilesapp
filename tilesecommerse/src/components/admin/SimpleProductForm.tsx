@@ -18,7 +18,7 @@ const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:4
 import { colorMapping } from "@/constants/colors";
 import {
   FINISH_TYPES, MATERIAL_TYPES, Unit,
-  MAX_FILE_SIZE, MAX_IMAGES, VALID_IMAGE_TYPES,
+  MAX_FILE_SIZE, VALID_IMAGE_TYPES,
 } from "@/constants/productFormOptions";
 import { generateUUID, fileToBase64 } from "@/utils/imageUtils";
 
@@ -118,12 +118,6 @@ export function SimpleProductForm() {
   const handleImageSelect = (files: FileList | null) => {
     if (!files) return;
 
-    // Validate image count
-    if (imagePreviews.length + files.length > MAX_IMAGES) {
-      setError(`Maximum ${MAX_IMAGES} images allowed. You can upload ${MAX_IMAGES - imagePreviews.length} more.`);
-      return;
-    }
-
     const newImages: Array<{ file: File; preview: string; id: string }> = [];
     for (const file of Array.from(files)) {
       // Validate file type
@@ -196,6 +190,9 @@ export function SimpleProductForm() {
     setFeaturedImageIndex(index);
   };
 
+  // All variant mutations use the updater form — see the note in the edit page:
+  // reading `variants` from the closure loses writes when two handlers fire
+  // inside one render window, which is what dropped variants on large products.
   const handleVariantImageSelect = (variantId: string, files: FileList | null) => {
     if (!files) return;
 
@@ -205,7 +202,7 @@ export function SimpleProductForm() {
       id: generateUUID()
     }));
 
-    setVariants(variants.map(v =>
+    setVariants(prev => prev.map(v =>
       v.id === variantId
         ? { ...v, images: [...v.images, ...newImages] }
         : v
@@ -213,7 +210,7 @@ export function SimpleProductForm() {
   };
 
   const removeVariantImage = (variantId: string, imageId: string) => {
-    setVariants(variants.map(v => {
+    setVariants(prev => prev.map(v => {
       if (v.id === variantId) {
         // Revoke blob URL to prevent memory leak
         const imageToRemove = v.images.find(img => img.id === imageId);
@@ -235,7 +232,7 @@ export function SimpleProductForm() {
   };
 
   const setVariantFeaturedImage = (variantId: string, index: number) => {
-    setVariants(variants.map(v =>
+    setVariants(prev => prev.map(v =>
       v.id === variantId ? { ...v, featuredImageIndex: index } : v
     ));
   };
@@ -255,17 +252,17 @@ export function SimpleProductForm() {
       images: [],
       featuredImageIndex: 0
     };
-    setVariants([...variants, newVariant]);
+    setVariants(prev => [...prev, newVariant]);
   };
 
   const updateVariant = (id: string, field: string, value: string) => {
-    setVariants(variants.map(v =>
+    setVariants(prev => prev.map(v =>
       v.id === id ? { ...v, [field]: value } : v
     ));
   };
 
   const removeVariant = (id: string) => {
-    setVariants(variants.filter(v => v.id !== id));
+    setVariants(prev => prev.filter(v => v.id !== id));
   };
 
   const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {

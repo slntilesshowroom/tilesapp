@@ -515,6 +515,73 @@ exports.bulkCreateProducts = asyncErrorHandler(async (req, res, next) => {
     });
 });
 
+// Images arrive from the admin forms as the *full intended list* in display
+// order. Each entry is either an existing Cloudinary URL to keep, a base64
+// `data:` URI to upload, or (from the bulk inline editor) an already-shaped
+// { public_id, url } object.
+//
+// Reconciling the list against a url -> image map is what makes removals work:
+// the previous version appended new uploads onto the stored array and never
+// looked at what the admin had deleted. Keying on the URL also drops the old
+// guess-which-variant-this-belonged-to lookup — a Cloudinary URL is unique
+// across the whole product, so no identity matching is needed.
+const reconcileImages = async (incoming, existingByUrl, folder, featuredIndex) => {
+    const out = [];
+
+    for (const entry of incoming) {
+        const url = typeof entry === 'string' ? entry : entry?.url;
+        if (!url) continue;
+
+        if (url.startsWith('data:')) {
+            const result = await cloudinary.v2.uploader.upload(url, { folder });
+            out.push({ public_id: result.public_id, url: result.secure_url });
+        } else {
+            const existing = existingByUrl.get(url);
+            // Always keep the image. Silently skipping an unmatched URL is what
+            // used to empty out every variant except the first.
+            out.push({
+                public_id: existing?.public_id || (typeof entry === 'object' ? entry.public_id : '') || '',
+                url: existing?.url || url,
+            });
+        }
+    }
+
+    const featured = Number(featuredIndex);
+    const resolved = Number.isInteger(featured) && featured >= 0 && featured < out.length ? featured : 0;
+    out.forEach((img, i) => { img.isFeatured = i === resolved; });
+
+    return out;
+};
+
+// Free the Cloudinary assets the admin removed. Kept deliberately non-fatal:
+// a Cloudinary hiccup here would otherwise 500 the request and throw away an
+// edit that is already fully computed. An orphaned asset costs storage; a lost
+// edit costs the admin their work.
+const destroyRemovedImages = async (oldImages, keptImages) => {
+    const kept = new Set(keptImages.map((img) => img.public_id).filter(Boolean));
+
+    for (const img of oldImages) {
+        if (!img.public_id || kept.has(img.public_id)) continue;
+        try {
+            await cloudinary.v2.uploader.destroy(img.public_id);
+        } catch (err) {
+            console.error(`Cloudinary cleanup failed for ${img.public_id}:`, err.message);
+        }
+    }
+};
+
+// The edit form sends featuredImageIndex; the bulk inline editor sends images
+// that already carry isFeatured. Support both.
+const featuredIndexOf = (variant) => {
+    if (variant.featuredImageIndex !== undefined) return Number(variant.featuredImageIndex);
+    const i = (variant.images || []).findIndex((img) => typeof img === 'object' && img?.isFeatured);
+    return i >= 0 ? i : 0;
+};
+
+// Exported for productImages.test.js.
+exports._reconcileImages = reconcileImages;
+exports._featuredIndexOf = featuredIndexOf;
+
 // Update Product ---ADMIN
 exports.updateProduct = asyncErrorHandler(async (req, res, next) => {
 
@@ -524,48 +591,39 @@ exports.updateProduct = asyncErrorHandler(async (req, res, next) => {
         return next(new ErrorHandler("Product Not Found", 404));
     }
 
+    const existingImages = product.images || [];
+
     if (req.body.images !== undefined) {
-        let images = [];
-        if (typeof req.body.images === "string") {
-            images.push(req.body.images);
-        } else if (Array.isArray(req.body.images)) {
-            images = req.body.images;
+        const incoming = typeof req.body.images === 'string'
+            ? [req.body.images]
+            : (Array.isArray(req.body.images) ? req.body.images : []);
+
+        const byUrl = new Map(existingImages.map((img) => [img.url, img]));
+        const reconciled = await reconcileImages(incoming, byUrl, 'products', req.body.featuredImageIndex);
+
+        if (reconciled.length > 0) {
+            await destroyRemovedImages(existingImages, reconciled);
+            req.body.images = reconciled;
+        } else {
+            // A product must keep at least one image, and the forms already
+            // enforce that — so an empty list means a malformed payload, not an
+            // intent to delete every photo. Leave the stored images alone.
+            delete req.body.images;
         }
-
-        if (images && images.length > 0) {
-            // Keep existing images and append new ones
-            const imagesLink = [...(product.images || [])];
-
-            for (let i = 0; i < images.length; i++) {
-                const result = await cloudinary.v2.uploader.upload(images[i], {
-                    folder: "products",
-                });
-
-                imagesLink.push({
-                    public_id: result.public_id,
-                    url: result.secure_url,
-                    isFeatured: false,
-                });
-            }
-            req.body.images = imagesLink;
-        }
-    }
-
-    // FIX: Handle featured image index update (when user changes featured image without uploading new ones)
-    if (req.body.featuredImageIndex !== undefined && product.images && product.images.length > 0) {
+    } else if (req.body.featuredImageIndex !== undefined && existingImages.length > 0) {
+        // Featured image changed without touching the image list.
         const featuredIndex = parseInt(req.body.featuredImageIndex);
-        if (featuredIndex >= 0 && featuredIndex < product.images.length) {
-            // Update all images to set only the selected one as featured
-            product.images.forEach((img, index) => {
-                img.isFeatured = index === featuredIndex;
-            });
-            // Mark the images field as modified so Mongoose saves it
-            product.markModified('images');
-            await product.save();
+        if (featuredIndex >= 0 && featuredIndex < existingImages.length) {
+            req.body.images = existingImages.map((img, index) => ({
+                public_id: img.public_id,
+                url: img.url,
+                isFeatured: index === featuredIndex,
+            }));
         }
-        // Remove featuredImageIndex from req.body so it doesn't get saved as a field
-        delete req.body.featuredImageIndex;
     }
+
+    // Never persisted — it only tells us which image to flag.
+    delete req.body.featuredImageIndex;
 
     // Handle brand logo update
     if (req.body.logo && req.body.logo.length > 0) {
@@ -631,61 +689,52 @@ exports.updateProduct = asyncErrorHandler(async (req, res, next) => {
         req.body.tags = JSON.parse(req.body.tags);
     }
 
-    // Handle variants with images
-    if (req.body.variants && typeof req.body.variants === 'string') {
-        const variants = JSON.parse(req.body.variants);
+    // Handle variants with images.
+    // The edit form sends a JSON string; the bulk inline editor sends an array.
+    if (req.body.variants !== undefined) {
+        const variants = typeof req.body.variants === 'string'
+            ? JSON.parse(req.body.variants)
+            : req.body.variants;
 
-        // Process variant images
-        const processedVariants = [];
-        for (const variant of variants) {
-            const variantData = { ...variant };
+        if (Array.isArray(variants)) {
+            // One url -> image map for *every* existing variant image. The old
+            // code tried to work out which variant an image came from by
+            // matching productId/color/size; variant SKU is optional, so a
+            // blank one matched `'' === ''` on variant #0 and every later
+            // variant's images were looked up against the wrong variant, came
+            // back unmatched, and were dropped.
+            const existingVariantImages = (product.variants || []).flatMap((v) => v.images || []);
+            const byUrl = new Map(existingVariantImages.map((img) => [img.url, img]));
 
-            // Upload variant images if they exist and are base64 strings (new uploads)
-            if (variant.images && Array.isArray(variant.images) && variant.images.length > 0) {
-                const variantImagesLink = [];
+            const processedVariants = [];
+            for (const variant of variants) {
+                const { featuredImageIndex, ...variantData } = variant;
 
-                for (let i = 0; i < variant.images.length; i++) {
-                    const image = variant.images[i];
-
-                    // Check if this is a new base64 image upload or an existing URL
-                    if (typeof image === 'string' && image.startsWith('data:')) {
-                        // New image - upload to Cloudinary
-                        const result = await cloudinary.v2.uploader.upload(image, {
-                            folder: "products/variants",
-                        });
-
-                        variantImagesLink.push({
-                            public_id: result.public_id,
-                            url: result.secure_url,
-                            isFeatured: i === (variant.featuredImageIndex || 0)
-                        });
-                    } else if (typeof image === 'string' && image.startsWith('http')) {
-                        // Existing image URL - keep as is
-                        // Find the existing image from the product to preserve public_id
-                        const existingVariant = product.variants?.find(v =>
-                            v.productId === variant.productId ||
-                            (v.color === variant.color && v.size === variant.size)
-                        );
-                        const existingImage = existingVariant?.images?.find(img => img.url === image);
-
-                        if (existingImage) {
-                            variantImagesLink.push({
-                                public_id: existingImage.public_id,
-                                url: existingImage.url,
-                                isFeatured: i === (variant.featuredImageIndex || 0)
-                            });
-                        }
-                    }
+                if (Array.isArray(variant.images)) {
+                    variantData.images = await reconcileImages(
+                        variant.images,
+                        byUrl,
+                        'products/variants',
+                        featuredIndexOf(variant)
+                    );
                 }
 
-                variantData.images = variantImagesLink;
-                delete variantData.featuredImageIndex; // Remove this as we use isFeatured instead
+                processedVariants.push(variantData);
             }
 
-            processedVariants.push(variantData);
-        }
+            // Only clean up when the payload described every variant's images.
+            // A variant sent without an `images` array tells us nothing about
+            // what it should keep, so deleting on that basis would destroy
+            // assets the admin never removed.
+            if (variants.every((v) => Array.isArray(v.images))) {
+                await destroyRemovedImages(
+                    existingVariantImages,
+                    processedVariants.flatMap((v) => v.images || [])
+                );
+            }
 
-        req.body.variants = processedVariants;
+            req.body.variants = processedVariants;
+        }
     }
 
     req.body.user = req.user.id;
